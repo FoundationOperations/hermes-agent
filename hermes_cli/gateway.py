@@ -2504,6 +2504,37 @@ def stop_profile_gateway() -> bool:
     if pid is None:
         return _reap_unsupervised_gateway_orphans()
 
+    # Cross-profile kill refusal (#89315): a poisoned/contaminated PID record
+    # in THIS profile's home can name another profile's live gateway (the
+    # record's hermes_home stamp records the true owner). Signaling it starts
+    # the mutual SIGTERM restart loop from the issue report — refuse instead.
+    try:
+        from gateway.status import (
+            _pid_from_record,
+            _read_gateway_lock_record,
+            _read_pid_record,
+            read_runtime_status,
+            recorded_gateway_home_conflicts,
+        )
+
+        for _record in (
+            _read_pid_record(),
+            _read_gateway_lock_record(),
+            read_runtime_status(),
+        ):
+            if _pid_from_record(_record) != pid:
+                continue
+            if recorded_gateway_home_conflicts(_record):
+                print(
+                    f"✗ Refusing to stop PID {pid}: its recorded HERMES_HOME "
+                    "belongs to a different profile (stale/poisoned PID "
+                    "record, #89315). Stop that profile explicitly or remove "
+                    "the stale gateway.pid."
+                )
+                return False
+    except Exception as exc:
+        logger.debug("cross-profile ownership probe failed for PID %s: %s", pid, exc)
+
     try:
         from gateway.status import write_planned_stop_marker
 
@@ -5833,7 +5864,36 @@ def _wait_for_gateway_exit(
             and not force_sent
             and time.monotonic() >= force_deadline
         ):
-            # Grace period expired — force-kill the specific PID.
+            # Grace period expired — force-kill the specific PID, but never
+            # across a profile boundary (#89315): when the PID record that
+            # produced this PID names a different profile's HERMES_HOME, the
+            # graceful stop above was already refused and this escalation
+            # must not fire either.
+            try:
+                from gateway.status import (
+                    _pid_from_record,
+                    _read_gateway_lock_record,
+                    _read_pid_record,
+                    read_runtime_status,
+                    recorded_gateway_home_conflicts,
+                )
+
+                if any(
+                    _pid_from_record(_record) == pid
+                    and recorded_gateway_home_conflicts(_record)
+                    for _record in (
+                        _read_pid_record(),
+                        _read_gateway_lock_record(),
+                        read_runtime_status(),
+                    )
+                ):
+                    print(
+                        f"✗ Refusing to force-kill PID {pid}: recorded "
+                        "HERMES_HOME belongs to a different profile (#89315)."
+                    )
+                    return False
+            except Exception:
+                pass
             try:
                 terminate_pid(
                     pid,
