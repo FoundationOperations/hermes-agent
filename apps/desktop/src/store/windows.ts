@@ -1,4 +1,6 @@
 import { notifyError } from './notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from './profile'
+import { $sessions, rememberedSessionProfile } from './session'
 
 // Window flag set by the Electron main process when it opens a standalone
 // session window (see electron/main.ts buildSessionWindowUrl). It rides in the
@@ -189,13 +191,20 @@ async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage:
 // Open (or focus) a standalone OS window for a single chat session. No-ops
 // gracefully outside Electron so callers can wire it unconditionally.
 // `watch: true` opens a spectator window (lazy resume, live-mirror stream).
+// The window is a full renderer that adopts the PRIMARY profile unless told
+// otherwise, so the owning profile rides along (same ladder as openHud,
+// #82285): the session's stamped owner wins, and an unstamped/uncached id —
+// a brand-new subagent child — inherits the profile the user is looking at
+// (#82768, #61286).
 export async function openSessionInNewWindow(sessionId: string, opts?: { watch?: boolean }): Promise<void> {
   if (!sessionId || !canOpenSessionWindow()) {
     return
   }
 
+  const profile = normalizeProfileKey(rememberedSessionProfile($sessions.get(), sessionId, $activeGatewayProfile.get()))
+
   await runWindowOpen(
-    () => window.hermesDesktop.openSessionWindow(sessionId, opts),
+    () => window.hermesDesktop.openSessionWindow(sessionId, { ...opts, profile }),
     'Could not open chat in a new window'
   )
 }
