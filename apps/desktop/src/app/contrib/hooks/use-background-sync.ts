@@ -92,7 +92,7 @@ export async function reconcileTileTranscripts({
   busyRef: MutableRefObject<boolean>
   requestSequenceRef: MutableRefObject<number>
   signatureRef: MutableRefObject<Map<string, string>>
-  tiles?: Array<{ storedSessionId: string; runtimeId?: string }>
+  tiles?: Array<{ ownerRoute?: SessionProfileRoute; storedSessionId: string; runtimeId?: string }>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -127,19 +127,27 @@ export async function reconcileTileTranscripts({
       ? tilesOverride.some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
       : $sessionTiles.get().some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
 
+    // Read the transcript from the store that OWNS the tile — a routed
+    // profile's Bot Chat lives in that profile's state.db, not the launch
+    // home's. Same scope reconcileActiveTranscript uses for the main pane.
+    const profileScope: ProfileScope = tile.ownerRoute
+      ? { connectionId: tile.ownerRoute.connectionId, profile: tile.ownerRoute.targetProfile ?? tile.ownerRoute.profile }
+      : undefined
+
+    const signatureKey = `tile:${storedSessionId}:${tile.ownerRoute?.connectionId ?? ''}:${profileScope?.profile ?? ''}`
+
     try {
-      const latest = await getLatestSessionMessages(storedSessionId)
+      const latest = await getLatestSessionMessages(storedSessionId, profileScope)
 
       if (requestId !== requestSequenceRef.current || busyRef.current || !stillPresent) {
         // Tile closed or superseded mid-read — discard AND prune its
         // signature so the map doesn't grow one entry per ever-opened tile
         // for the app's lifetime (#94255 review point 3).
-        signatureRef.current.delete(`tile:${storedSessionId}`)
+        signatureRef.current.delete(signatureKey)
 
         continue
       }
 
-      const signatureKey = `tile:${storedSessionId}`
       const signature = sessionMessagesSignature(latest.messages)
 
       if (signatureRef.current.get(signatureKey) === signature) {

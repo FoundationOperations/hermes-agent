@@ -259,7 +259,32 @@ describe('active transcript refresh', () => {
 
     // Behavior assertions:
     expect(updaterCallCount).toBeGreaterThan(0)
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, undefined)
+  })
+
+  it('reads a tile transcript from its owning profile store (#99333)', async () => {
+    $changeEventsAvailable.set(true)
+    $activeSessionId.set('runtime-something-else')
+    $selectedStoredSessionId.set('stored-other')
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('bot answer', 'stored-bot-tile') as never)
+
+    await act(async () => {
+      await reconcileTileTranscriptsForTest({
+        tiles: [
+          {
+            ownerRoute: { connectionId: 'conn-a', mode: 'local', profile: 'default', targetProfile: 'bot' },
+            storedSessionId: 'stored-bot-tile',
+            runtimeId: 'runtime-bot-tile'
+          }
+        ],
+        busyRef: { current: false },
+        requestSequenceRef: { current: 0 },
+        signatureRef: { current: new Map<string, string>() },
+        updateSessionState: vi.fn()
+      })
+    })
+
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-bot-tile', { connectionId: 'conn-a', profile: 'bot' })
   })
 
   it('skips the tile fetch entirely when nothing changed (signature-gated)', async () => {
@@ -284,7 +309,7 @@ describe('active transcript refresh', () => {
     // Compute the same signature the reconcile will compute, and pre-seed it.
     const preSignature = sessionMessagesSignature(pre.messages as never)
 
-    signatureRef.current.set(`tile:${TILE_STORED_ID}`, preSignature)
+    signatureRef.current.set(`tile:${TILE_STORED_ID}::`, preSignature)
 
     const updateSessionState = vi.fn()
     const busyRef = { current: false }
