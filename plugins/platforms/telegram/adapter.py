@@ -5638,6 +5638,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._observe_bot_identity_from_message(message)
         if self._is_own_message(message):
             return False
+        if self._chat_type_str(getattr(message, "chat", None)) == "channel":
+            return self._should_process_channel_post(message)
         if not self._is_group_chat(message):
             return True
         thread_id = self._effective_message_thread_id(message)
@@ -5665,6 +5667,22 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._telegram_require_mention() or self._is_reply_to_bot(message):
             return True
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
+            return True
+        return self._message_matches_mention_patterns(message)
+
+    def _should_process_channel_post(self, message: Message) -> bool:
+        """Channel posts carry no per-user sender (every post reads as the channel), so they get the
+        group trigger rules: ``allowed_chats``, free-response chats, then ``require_mention`` (reply to
+        the bot, @mention, or wake word). Treating them as DMs answered every post in alert channels."""
+        chat_id_str = self._chat_id_str(message)
+        allowed = self._telegram_allowed_chats()
+        if allowed and chat_id_str not in allowed:
+            return False
+        if chat_id_str in self._telegram_free_response_chats():
+            return True
+        if not self._telegram_require_mention() or self._is_reply_to_bot(message):
+            return True
+        if self._message_mentions_bot(message):
             return True
         return self._message_matches_mention_patterns(message)
 

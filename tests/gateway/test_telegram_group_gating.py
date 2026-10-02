@@ -297,6 +297,34 @@ class _FakeSessionStore:
         self.messages.append((session_id, message, skip_db))
 
 
+def _channel_post(text="ALERT: queue backed up", *, chat_id=-1003979931045, entities=None, reply_to_bot=False):
+    msg = _group_message(text, chat_id=chat_id, entities=entities, reply_to_bot=reply_to_bot)
+    msg.chat = SimpleNamespace(id=chat_id, type="channel", title="Alerts", is_forum=False)
+    msg.from_user = None
+    return msg
+
+
+def test_channel_posts_follow_require_mention_like_groups():
+    adapter = _make_adapter(require_mention=True)
+    assert adapter._should_process_message(_channel_post()) is False
+    text = "@hermes_bot is this real?"
+    assert adapter._should_process_message(_channel_post(text, entities=[_mention_entity(text)])) is True
+    assert adapter._should_process_message(_channel_post("follow-up", reply_to_bot=True)) is True
+    assert adapter._should_process_message(_channel_post("/status"), is_command=True) is False
+
+
+def test_channel_posts_unrestricted_when_mention_not_required_or_free_response():
+    assert _make_adapter(require_mention=False)._should_process_message(_channel_post()) is True
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-1003979931045"])
+    assert adapter._should_process_message(_channel_post()) is True
+
+
+def test_channel_posts_respect_allowed_chats():
+    adapter = _make_adapter(require_mention=False, allowed_chats=["-100"])
+    assert adapter._should_process_message(_channel_post(chat_id=-100)) is True
+    assert adapter._should_process_message(_channel_post(chat_id=-200)) is False
+
+
 def test_group_messages_can_require_direct_trigger_via_config():
     adapter = _make_adapter(require_mention=True)
 
