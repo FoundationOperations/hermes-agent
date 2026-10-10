@@ -175,6 +175,20 @@ def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes
     return None
 
 
+def _remote_gateway_restart_hosts() -> list:
+    """``terminal.remote_gateway_restart_hosts``: ssh destinations whose remote payload may run a
+    gateway lifecycle command (it restarts a gateway on another box, not this one). Empty by
+    default; any config problem yields empty, i.e. the strict guard."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        terminal = (read_raw_config() or {}).get("terminal")
+        hosts = terminal.get("remote_gateway_restart_hosts") if isinstance(terminal, dict) else None
+        return list(hosts) if isinstance(hosts, (list, tuple)) else []
+    except Exception:
+        return []
+
+
 def gateway_lifecycle_block(
     *,
     command: str,
@@ -232,6 +246,7 @@ def gateway_lifecycle_block(
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
+        remote_ssh_hosts=_remote_gateway_restart_hosts(),
         read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
     )
     if unsafe and refusal:
