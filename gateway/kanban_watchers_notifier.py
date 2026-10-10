@@ -361,10 +361,41 @@ def _payload(ev: Any, key: str) -> Any:
     return ev.payload.get(key) if ev.payload and ev.payload.get(key) else None
 
 
-def _clip(ev: Any, key: str, fmt: str, limit: int) -> str:
-    """``fmt`` applied to the truncated payload value, or ``""`` when absent."""
+SUMMARY_LIMIT = 280
+
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+_MACHINE_BITS = re.compile(
+    r"\bpid\s*\d+( not alive)?|\bclaimer\s*\S+|\b[\w-]+:\d{3,}\b|Worker's last output:?", re.IGNORECASE
+)
+
+
+def _trim(text: str, limit: int = SUMMARY_LIMIT) -> str:
+    """Whitespace-collapsed ``text`` cut at a sentence, else word, boundary with ``…`` (never mid-word)."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(text) <= limit:
+        return text
+    window = text[: limit - 1]
+    ends = [m.end() for m in _SENTENCE_END.finditer(window)]
+    if ends and ends[-1] >= limit // 2:
+        return window[: ends[-1]].rstrip() + "…"
+    sp = window.rfind(" ")
+    cut = window[:sp] if sp >= limit // 3 else window  # single giant token: hard cut is all we can do
+    return cut.rstrip(" ,;:-—") + "…"
+
+
+def _readable(text: Any) -> str:
+    """Worker/dispatcher text made phone-safe: no ANSI/spinner chrome, pids, or lock ids."""
+    from hermes_cli.kanban_db_dispatch import clean_worker_text
+
+    cleaned = clean_worker_text(_MACHINE_BITS.sub(" ", str(text or "")))
+    return re.sub(r"\s+", " ", cleaned).strip(" .:;,-")
+
+
+def _clip(ev: Any, key: str, fmt: str, limit: int = SUMMARY_LIMIT) -> str:
+    """``fmt`` applied to the readable, boundary-trimmed payload value, or ``""`` when absent/junk."""
     value = _payload(ev, key)
-    return fmt.format(str(value)[:limit]) if value else ""
+    text = _trim(_readable(value), limit) if value else ""
+    return fmt.format(text) if text else ""
 
 
 _NL = "\n{}"
@@ -372,7 +403,7 @@ _NL = "\n{}"
 
 def _first_line(text: str, limit: int) -> str:
     lines = text.strip().splitlines()
-    return lines[0][:limit] if lines else text[:limit]
+    return _trim(lines[0] if lines else text, limit)
 
 
 def _fmt_completed(ev, n) -> tuple:
@@ -380,9 +411,9 @@ def _fmt_completed(ev, n) -> tuple:
     wake_handoff = None
     payload_summary = _payload(ev, "summary")
     if payload_summary:
-        wake_handoff = _first_line(str(payload_summary), 200)
+        wake_handoff = _first_line(str(payload_summary), SUMMARY_LIMIT)
     elif n.task and n.task.result:
-        wake_handoff = _first_line(n.task.result, 160)
+        wake_handoff = _first_line(n.task.result, SUMMARY_LIMIT)
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
     return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None
 
@@ -395,8 +426,8 @@ def _fmt_review_requested(ev, n) -> tuple:
     summary = _payload(ev, "summary")
     if summary:
         summary = str(summary)
-        handoff = f"\n{summary[:200]}"
-        wake_handoff = _first_line(summary, 200)
+        handoff = f"\n{_first_line(summary, SUMMARY_LIMIT)}"
+        wake_handoff = _first_line(summary, SUMMARY_LIMIT)
     return f"👀 {n.head} ready for review — {n.title}{handoff}", wake_handoff, None
 
 
@@ -428,20 +459,50 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
     msg = (
         f"🛑 {n.head} routed to TRIAGE — "
         f"{'needs a human decision' if decision else 'for orchestration attention'}"
-        f"{_clip(ev, 'recurrences', ' (blocked {}x for the same cause)', 200)}{_clip(ev, 'reason', ': {}', 160)}"
+        f"{_clip(ev, 'recurrences', ' (blocked {}x for the same cause)', 20)}{_clip(ev, 'reason', ': {}')}"
     )
     return msg, None, None
+
+
+def _plain_cause(ev) -> str:
+    """Short plain-English reason from a failure event; never raw error text, pids or lock ids."""
+    p = ev.payload or {}
+    raw = str(p.get("error") or "")
+    if p.get("terminal_provider"):
+        return "the model provider rejected its credentials"
+    if p.get("protocol_violation") or "protocol violation" in raw:
+        return "its worker finished without reporting back"
+    if re.search(r"rate.?limit|\b429\b", raw, re.IGNORECASE) or p.get("rate_limited"):
+        return "the model provider was rate-limiting it"
+    if "timed out" in raw.lower() or "timeout" in raw.lower():
+        return "it ran out of time"
+    return "its worker died mid-job"
+
+
+def _detail_line(ev) -> str:
+    """The worker's own last words, if the dispatcher captured readable ones; else nothing."""
+    raw = str((ev.payload or {}).get("error") or "")
+    m = re.search(r"Worker's last output:?(.*)", raw, re.IGNORECASE | re.DOTALL)
+    text = _trim(_readable(m.group(1)), SUMMARY_LIMIT) if m else ""
+    return f"\n{text}" if text else ""
 
 
 def _fmt_gave_up(ev, n) -> tuple:
     # The dispatcher auto-blocked the task after ``failures`` consecutive non-success attempts
     # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
+    # Machine fields (pid, claimer, raw error) stay in the event payload for the agent/wake turn.
     failures = _payload(ev, "failures")
-    count = f"it failed {int(failures)} times in a row" if failures else "it kept failing"
-    last = _clip(ev, "error", " (last: {})", 160)
+    tries = f"{int(failures)} failed {'try' if int(failures) == 1 else 'tries'}" if failures else "repeated failures"
     return (
-        f"⛔ {n.head} is now blocked: {count}{last}. Fix the cause, then `hermes kanban unblock "
-        f"{n.task_id}` (or `hermes kanban reassign {n.task_id}`). Logs: `hermes kanban log {n.task_id}`.",
+        f"⛔ {n.title} ({n.task_id}) stopped after {tries}: {_plain_cause(ev)}. Needs unblock."
+        f"{_detail_line(ev)}",
+        None, None,
+    )
+
+
+def _fmt_crashed(ev, n) -> tuple:
+    return (
+        f"✖ {n.title} ({n.task_id}) — {_plain_cause(ev)}; retrying automatically.{_detail_line(ev)}",
         None, None,
     )
 
@@ -450,7 +511,7 @@ def _fmt_timed_out(ev, n) -> tuple:
     limit = int(_payload(ev, "limit_seconds") or 0)
     minutes = max(1, round(limit / 60)) if limit else 0
     span = f"its {minutes}-minute limit" if minutes else "its time limit"
-    return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
+    return f"⏱ {n.title} ({n.task_id}) ran past {span} and was stopped; retrying automatically.", None, None
 
 
 # archived / unblocked are claimed (so the cursor advances past them) but
@@ -458,11 +519,9 @@ def _fmt_timed_out(ev, n) -> tuple:
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "completed": _fmt_completed,
-    "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
+    "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}')}", None, None),
     "gave_up": _fmt_gave_up,
-    "crashed": lambda ev, n: (
-        f"✖ {n.head} — its worker stopped unexpectedly; it will be retried automatically.", None, None,
-    ),
+    "crashed": _fmt_crashed,
     "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
