@@ -978,6 +978,33 @@ _EXIT_SUMMARY_MARKER = "Resume this session with:"
 # Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
 _LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
 _LOG_NOISE_PREFIXES = ("session_id:", "Query:", "Initializing agent")
+# Terminal escapes (CSI + OSC) and the live tool-progress chrome the CLI prints while a worker runs:
+# ``┊`` separators, ``⚡ preparing mcp__x…`` spinners, bare ``mcp__x…`` tokens, braille spinner frames.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_PROGRESS_RE = re.compile(
+    r"[┊⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"
+    r"|⚡\s*(?:preparing\b)?"
+    r"|\bpreparing\s+(?=mcp__)"
+    r"|\bmcp__[A-Za-z0-9_]+…?"
+)
+
+
+def clean_worker_text(raw: str) -> str:
+    """Strip ANSI, spinner/tool-progress chrome and rule lines; collapse whitespace.
+
+    Returns \"\" when nothing human-readable is left (callers then say nothing rather than show junk).
+    """
+    if not raw:
+        return ""
+    raw = _ANSI_RE.sub("", raw)
+    out: list[str] = []
+    for ln in raw.splitlines():
+        ln = _PROGRESS_RE.sub(" ", _LOG_CHROME.sub("", ln))
+        ln = re.sub(r"\s+", " ", ln).strip(" \t'\"…")
+        if ln and not ln.startswith(_LOG_NOISE_PREFIXES) and re.search(r"[A-Za-z0-9]", ln):
+            if not out or out[-1] != ln:
+                out.append(ln)
+    return " ".join(out)
 
 
 def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
@@ -1005,12 +1032,13 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     cut = raw.rfind(_EXIT_SUMMARY_MARKER)
     if cut != -1:
         raw = raw[:cut]
-    lines = []
-    for ln in raw.splitlines():
-        ln = _LOG_CHROME.sub("", ln).strip()
-        if ln and not ln.startswith(_LOG_NOISE_PREFIXES):
-            lines.append(ln)
-    return " ".join(lines)[-400:]
+    text = clean_worker_text(raw)
+    if len(text) > 400:
+        # Keep the tail (the conclusion) but start on a word boundary, not mid-word.
+        tail = text[-400:]
+        sp = tail.find(" ")
+        text = "…" + (tail[sp + 1:] if 0 <= sp < 60 else tail)
+    return text
 
 
 @dataclass
