@@ -693,6 +693,119 @@ def _executed_command_index(segment: list[str]) -> Optional[int]:
     return index if index < len(segment) else None
 
 
+# --- remote gateway restarts over ssh -----------------------------------------------------------
+# `ssh folab 'systemctl --user restart hermes-gateway-folab'` restarts a gateway on ANOTHER box;
+# it cannot SIGTERM this process. The terminal guard may pass it, but only for hosts the operator
+# listed in `terminal.remote_gateway_restart_hosts`. Everything outside the allowlisted ssh
+# segment (chained commands, other segments, `$(...)` smuggled into the payload) is still scanned.
+_SSH_VALUE_OPTIONS = frozenset("bBcDEeFIiJLlmOopQRSWw")
+_SSH_LOCAL_EXEC_OPTION_RE = re.compile(r"(?i)\b(?:proxycommand|localcommand|permitlocalcommand|include|hostname|match|knownhostscommand)\b")
+_LOCAL_HOST_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost", "0.0.0.0", "::", "::1", "[::1]"})
+_COMMAND_SUBSTITUTION_MARKERS = ("`", "$(", "<(", ">(")
+
+
+def _is_this_machine(host: str) -> bool:
+    import socket
+
+    name = host.lower().rstrip(".")
+    if name in _LOCAL_HOST_NAMES or name.startswith("127."):
+        return True
+    try:
+        own = {socket.gethostname().lower(), socket.getfqdn().lower()}
+    except OSError:
+        own = set()
+    return name in own or name in {n.split(".")[0] for n in own}
+
+
+def _normalize_remote_hosts(hosts: object) -> frozenset[str]:
+    if isinstance(hosts, str):
+        hosts = [hosts]
+    if not isinstance(hosts, (list, tuple, set, frozenset)):
+        return frozenset()
+    return frozenset(h.strip().lower() for h in hosts if isinstance(h, str) and h.strip())
+
+
+def _ssh_remote_target(segment: list[str], allowed: frozenset[str]) -> Optional[int]:
+    """Index of the ssh token when *segment* is an ssh to an allowlisted, non-local host that
+    carries a remote command; else ``None`` (the segment is scanned as ordinary local text)."""
+    index = _executed_command_index(segment)
+    if index is None or _executable_name(segment[index]) != "ssh":
+        return None
+    position = index + 1
+    host: Optional[str] = None
+    while position < len(segment):
+        token = segment[position]
+        if token == "--":
+            position += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        letters = token[1:]
+        step = 1
+        for offset, letter in enumerate(letters):
+            if letter in _SSH_VALUE_OPTIONS:
+                attached = letters[offset + 1:]
+                value = attached if attached else (segment[position + 1] if position + 1 < len(segment) else "")
+                if not attached:
+                    step = 2
+                if letter == "F" or (letter == "o" and _SSH_LOCAL_EXEC_OPTION_RE.search(value)):
+                    return None  # alternate config / local-exec options: cannot vouch for the target
+                break
+        position += step
+    if position >= len(segment):
+        return None
+    destination = segment[position]
+    if destination.startswith("ssh://"):
+        destination = destination[len("ssh://"):].split("/", 1)[0]
+    host = destination.rsplit("@", 1)[-1]
+    if destination.startswith("-") or host.startswith("-") or host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    payload = segment[position + 1:]
+    if not payload or not host:
+        return None
+    if host.lower() not in allowed or _is_this_machine(host):
+        return None
+    if any(marker in token for token in payload for marker in _COMMAND_SUBSTITUTION_MARKERS):
+        return None  # substitutions in the payload may run locally
+    return index
+
+
+def mask_allowed_remote_ssh(command: str, remote_hosts: object) -> str:
+    """Replace the remote payload of ssh-to-allowlisted-host segments with a neutral placeholder.
+
+    Only masks; it can ALLOW what the plain scan would block, never block more. Lines that do not
+    tokenize, or contain no allowlisted ssh segment, are returned untouched (fail closed)."""
+    allowed = _normalize_remote_hosts(remote_hosts)
+    if not allowed or "ssh" not in command:
+        return command
+    out_lines: list[str] = []
+    changed = False
+    for line in _SHELL_LINE_CONTINUATION.sub(" ", command).split("\n"):
+        if "ssh" not in line:
+            out_lines.append(line)
+            continue
+        try:
+            tokens = _shlex_tokens(line)
+        except ValueError:
+            out_lines.append(line)
+            continue
+        rebuilt: list[str] = []
+        line_changed = False
+        for segment in _split_segments(tokens, keep_controls=True):
+            ssh_index = None if (len(segment) == 1 and set(segment[0]) <= _CONTROL_CHARS) else _ssh_remote_target(segment, allowed)
+            if ssh_index is None:
+                rebuilt.extend(segment)
+                continue
+            line_changed = True
+            rebuilt.extend(["ssh", "remote-host", "remote-command"])
+        if line_changed:
+            changed = True
+            out_lines.append(" ".join(rebuilt))
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines) if changed else command
+
+
 def contains_launchctl_submit_command(command: str) -> bool:
     """Detect an executed ``launchctl submit``/``bootstrap``, not quoted text.
 
@@ -1085,6 +1198,7 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+    remote_hosts: object = (),
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
@@ -1092,6 +1206,8 @@ def _contains_unsafe_gateway_action(
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
         return _budget_exhausted(budget, "text", depth) if executed else False
+    if remote_hosts:
+        command = mask_allowed_remote_ssh(command, remote_hosts)
     if _direct_lifecycle_scan(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
@@ -1101,6 +1217,7 @@ def _contains_unsafe_gateway_action(
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script, executed=executed,
+            remote_hosts=remote_hosts,
         )
 
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
@@ -1176,6 +1293,7 @@ def _contains_unsafe_gateway_action(
 def scan_gateway_lifecycle(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    remote_ssh_hosts: object = (),
 ) -> tuple[bool, Optional[str]]:
     """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
     size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
@@ -1194,7 +1312,7 @@ def scan_gateway_lifecycle(
     try:
         unsafe = _contains_unsafe_gateway_action(
             command, cwd=cwd, depth=0, visited=set(), budget=budget,
-            read_remote_script=read_remote_script,
+            read_remote_script=read_remote_script, remote_hosts=remote_ssh_hosts,
         )
         return unsafe, budget.refusal if unsafe else None
     except Exception:
@@ -1204,7 +1322,7 @@ def scan_gateway_lifecycle(
             exc_info=True,
         )
         try:
-            return _direct_lifecycle_scan(command), None
+            return _direct_lifecycle_scan(mask_allowed_remote_ssh(command, remote_ssh_hosts)), None
         except Exception:
             # If even the data-argument masker fails, fall to raw regex + submit scan: stay total.
             return (contains_gateway_lifecycle_command(command)
