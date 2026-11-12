@@ -4146,6 +4146,19 @@ class SlackAdapter(BasePlatformAdapter):
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         return getattr(runner, "_is_user_authorized", None)
 
+    def _chat_type_is_dm(self, channel_type: str, channel_id: str, is_dm: bool) -> bool:
+        """Authorization/source chat_type for an inbound event. A group DM (mpim) is "dm" like any
+        DM, EXCEPT when it is listed in ``extra.group_allowed_chats``: that explicit chat grant only
+        applies to "group" sources. Slack delivers one @mention as both ``message``
+        (channel_type=mpim) and ``app_mention`` (no channel_type, so "group"); without this the grant
+        hit or missed on whichever arrived first. Unlisted mpims keep DM semantics (default-deny)."""
+        if not is_dm or channel_type != "mpim":
+            return is_dm
+        granted = (getattr(getattr(self, "config", None), "extra", None) or {}).get("group_allowed_chats") or []
+        if isinstance(granted, str):
+            granted = granted.split(",")
+        return str(channel_id) not in {str(c).strip() for c in granted}
+
     def _early_reject_unauthorized(
             self, user_id: str, channel_id: str, is_dm: bool, *, thread_id: Optional[str] = None) -> bool:
         """True (logged) when the sender is definitively unauthorized. Injected profile-bound check
@@ -4598,6 +4611,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._remember_channel_team(channel_id, team_id)
         channel_type = event.get("channel_type", "") or ("im" if channel_id.startswith("D") else "")
         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
+        chat_is_dm = self._chat_type_is_dm(channel_type, channel_id, is_dm)
         if is_dm and self._slack_disable_dms():
             logger.info(
                 "[Slack] Ignoring DM because Slack DMs are disabled: channel=%s user=%s",
@@ -4609,7 +4623,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Reject unauthorized users before the expensive lookups/downloads;
         # the runner's own auth check only runs after MessageEvent is built.
         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
-        if self._early_reject_unauthorized(user_id, channel_id, is_dm, thread_id=thread_ts):
+        if self._early_reject_unauthorized(user_id, channel_id, chat_is_dm, thread_id=thread_ts):
             return
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         # Mentions may live only in Block Kit blocks.
@@ -4629,7 +4643,7 @@ class SlackAdapter(BasePlatformAdapter):
             not is_one_to_one_dm and bot_uid and not await self._channel_gate_allows(
             channel_id=channel_id, routing_text=routing_text, bot_uid=bot_uid,
             is_mentioned=is_mentioned, is_thread_reply=is_thread_reply,
-            event_thread_ts=event_thread_ts, user_id=user_id, team_id=team_id, is_dm=is_dm,
+            event_thread_ts=event_thread_ts, user_id=user_id, team_id=team_id, is_dm=chat_is_dm,
             force_process=force_process)):
             return
         # Claim the message ts HERE: a link unfurl emits `message_changed` with a different event
@@ -4649,7 +4663,7 @@ class SlackAdapter(BasePlatformAdapter):
         ) = await self._hydrate_thread_context(
             channel_id=channel_id, event_thread_ts=event_thread_ts, ts=ts, user_id=user_id,
             team_id=team_id, is_thread_reply=is_thread_reply, is_mentioned=is_mentioned,
-            is_dm=is_dm)
+            is_dm=chat_is_dm)
         # Thread-root media is delivered ahead of the trigger message's own files.
         media_urls, media_types, media_text_inlined, text = await self._collect_inbound_media(
             event, channel_id, team_id, text, thread_root_media_urls, thread_root_media_types)
@@ -4696,7 +4710,7 @@ class SlackAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=channel_id,
             chat_name=channel_name,
-            chat_type="dm" if is_dm else "group",
+            chat_type="dm" if self._chat_type_is_dm(event.get("channel_type", ""), channel_id, is_dm) else "group",
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,

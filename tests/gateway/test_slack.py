@@ -2180,6 +2180,58 @@ class TestMessageRouting:
         assert msg_event.message_id == "1234567890.000001"
 
 
+class TestMpimChatGrant:
+    """A group DM (mpim) is a shared room: group_allowed_chats must grant it like a channel."""
+
+    GRANTED = "C_GRANTED_MPIM"
+
+    @staticmethod
+    def _install_group_only_grant(adapter, granted):
+        seen = []
+
+        def check(user_id, chat_type=None, chat_id=None, **_kw):
+            seen.append(chat_type)
+            return chat_type == "group" and chat_id == granted  # mirrors _chat_scoped_grant
+
+        adapter._authorization_check = check
+        return seen
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_type", ["mpim", ""])  # `message` and `app_mention` shapes
+    async def test_listed_mpim_authorizes_for_nonallowlisted_user(self, adapter, channel_type):
+        adapter.config.extra["group_allowed_chats"] = [self.GRANTED]
+        seen = self._install_group_only_grant(adapter, self.GRANTED)
+        event = {
+            "text": "<@U_BOT> hello", "user": "U_APRIL", "channel": self.GRANTED,
+            "channel_type": channel_type, "team": "T123", "ts": "1234567890.000010",
+        }
+        await adapter._handle_slack_message(event)
+        assert seen and set(seen) == {"group"}
+        adapter.handle_message.assert_called_once()
+        assert adapter.handle_message.call_args[0][0].source.chat_type == "group"
+
+    @pytest.mark.asyncio
+    async def test_unlisted_mpim_still_rejected(self, adapter):
+        self._install_group_only_grant(adapter, self.GRANTED)
+        event = {
+            "text": "<@U_BOT> hello", "user": "U_APRIL", "channel": "C_OTHER_MPIM",
+            "channel_type": "mpim", "team": "T123", "ts": "1234567890.000011",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_to_one_im_still_dm(self, adapter):
+        seen = self._install_group_only_grant(adapter, self.GRANTED)
+        event = {
+            "text": "hi", "user": "U_APRIL", "channel": "D123",
+            "channel_type": "im", "team": "T123", "ts": "1234567890.000012",
+        }
+        await adapter._handle_slack_message(event)
+        assert set(seen) == {"dm"}
+        adapter.handle_message.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # TestSendTyping — assistant.threads.setStatus
 # ---------------------------------------------------------------------------
