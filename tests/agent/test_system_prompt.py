@@ -778,9 +778,9 @@ class TestSessionStartLike:
         from agent.system_prompt import _session_start_like
 
         class _Db:
-            def get_conversation_root(self, sid):
+            def get_compression_lineage(self, sid):
                 assert sid == "20260615_090000_seg9"
-                return "20260101_120000_root"
+                return ["20260101_120000_root", sid]
 
         now = datetime(2026, 6, 16, 9, 0, tzinfo=ZoneInfo("UTC"))
         agent = SimpleNamespace(
@@ -795,7 +795,7 @@ class TestSessionStartLike:
         from agent.system_prompt import _session_start_like
 
         class _Db:
-            def get_conversation_root(self, sid):
+            def get_compression_lineage(self, sid):
                 raise RuntimeError("db locked")
 
         now = datetime(2026, 6, 16, 9, 0, tzinfo=ZoneInfo("UTC"))
@@ -813,8 +813,8 @@ class TestSessionStartLike:
         from agent.system_prompt import _session_start_like
 
         class _Db:
-            def get_conversation_root(self, sid):
-                return "imported-legacy-root"
+            def get_compression_lineage(self, sid):
+                return ["imported-legacy-root", sid]
 
         now = datetime(2026, 6, 16, 9, 0, tzinfo=ZoneInfo("UTC"))
         agent = SimpleNamespace(
@@ -956,3 +956,38 @@ class TestConversationStartedTwoLine:
         vol = self._volatile(agent)
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
+
+
+class TestConversationStartedAfterSessionReset:
+    """/new, /reset and idle resets create a child row (parent_session_id=<previous>) that is NOT a
+    compression continuation. 'Conversation started' must show the NEW session's birth, not the
+    first session of the chat."""
+
+    def _agent(self, db, sid):
+        return SimpleNamespace(session_id=sid, session_start=None, _session_db=db)
+
+    def test_reset_child_reports_its_own_start(self, tmp_path):
+        from agent.system_prompt import _session_start_like
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("20261117_090000_old", source="telegram")
+        db.end_session("20261117_090000_old", "session_reset")
+        db.create_session("20261119_100754_new", source="telegram",
+                          parent_session_id="20261117_090000_old")
+        now = datetime(2026, 11, 19, 10, 8, tzinfo=ZoneInfo("UTC"))
+        start = _session_start_like(self._agent(db, "20261119_100754_new"), now)
+        assert start.strftime("%Y-%m-%d") == "2026-11-19"
+
+    def test_compression_chain_still_reports_root_start(self, tmp_path):
+        from agent.system_prompt import _session_start_like
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("20261117_090000_root", source="telegram")
+        db.end_session("20261117_090000_root", "compression")
+        db.create_session("20261119_100754_seg", source="telegram",
+                          parent_session_id="20261117_090000_root")
+        now = datetime(2026, 11, 19, 10, 8, tzinfo=ZoneInfo("UTC"))
+        start = _session_start_like(self._agent(db, "20261119_100754_seg"), now)
+        assert start.strftime("%Y-%m-%d") == "2026-11-17"
