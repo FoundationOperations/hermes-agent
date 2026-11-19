@@ -214,7 +214,11 @@ def _session_start_like(agent: Any, now: Any) -> Any:
     session_id = getattr(agent, "session_id", None)
     db = getattr(agent, "_session_db", None)
     try:
-        root_id = db.get_conversation_root(session_id) if db is not None and isinstance(session_id, str) and session_id else None
+        # Compression-only lineage: ``get_conversation_root`` walks EVERY parent link, and /new, /reset
+        # and idle resets also record parent_session_id=<previous session>, so it would resolve a fresh
+        # session to the first session of the whole chat and print that old date as "Conversation started".
+        lineage = db.get_compression_lineage(session_id) if db is not None and isinstance(session_id, str) and session_id else None
+        root_id = lineage[0] if lineage else None
     except Exception:
         root_id = None
     for candidate in (root_id, session_id):
